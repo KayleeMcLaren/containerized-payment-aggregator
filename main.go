@@ -25,8 +25,18 @@ type Aggregator struct {
 
 // newAggregator initializes the service with all providers, cache, and circuit breakers.
 func newAggregator() *Aggregator {
-	// 1. Initialize Redis Store
-	redisStore := cache.NewRedisStore("localhost:6379", "", 0)
+	// 1. Initialize Redis Store - READS FROM ENVIRONMENT VARIABLE
+	redisAddr := os.Getenv("REDIS_ADDR")
+	if redisAddr == "" {
+		// Fallback for local development/testing
+		redisAddr = "localhost:6379"
+		log.Println("WARNING: Using default Redis address: localhost:6379")
+	} else {
+		log.Printf("Using Redis address from environment: %s", redisAddr)
+	}
+
+	// Pass the retrieved address to the NewRedisStore constructor
+	redisStore := cache.NewRedisStore(redisAddr, "", 0)
 
 	// 2. Define Circuit Breaker Settings (Using ReadyToTrip for failure rate logic)
 	settings := gobreaker.Settings{
@@ -61,14 +71,17 @@ func newAggregator() *Aggregator {
 
 	// 3. Initialize Breaker and Aggregator
 	breakerMTN := gobreaker.NewCircuitBreaker(settings)
+	breakerAirtel := gobreaker.NewCircuitBreaker(settings)
 
 	return &Aggregator{
 		Providers: map[string]providers.PaymentProvider{
-			"MTN": providers.NewMTNProvider(),
+			"MTN":    providers.NewMTNProvider(),
+			"AIRTEL": providers.NewAirtelProvider(),
 		},
 		Store: redisStore,
 		Breakers: map[string]*gobreaker.CircuitBreaker{ // ASSIGN BREAKER
-			"MTN": breakerMTN,
+			"MTN":    breakerMTN,
+			"AIRTEL": breakerAirtel,
 		},
 	}
 }
@@ -111,11 +124,17 @@ func (a *Aggregator) PayHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	// --- IDEMPOTENCY CHECK END ---
 
-	// --- Provider Routing & Circuit Breaker Lookup ---
-	providerName := "MTN"
+	// --- Input Validation and Routing ---
+	// Use the ProviderKey from the request for routing. Default to MTN if invalid.
+	providerName := req.ProviderKey
+	if _, ok := a.Providers[providerName]; !ok {
+		providerName = "MTN"
+		log.Printf("Provider key '%s' not found. Defaulting to MTN.", req.ProviderKey)
+	}
+
 	provider, ok := a.Providers[providerName]
 	if !ok {
-		// ... (Error handling remains the same) ...
+		// This should not happen if default is set, but kept for safety
 		w.WriteHeader(http.StatusNotFound)
 		json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("Provider %s not found", providerName)})
 		return
@@ -127,8 +146,8 @@ func (a *Aggregator) PayHandler(w http.ResponseWriter, r *http.Request) {
 		log.Printf("Warning: No circuit breaker found for %s", providerName)
 	}
 
-	// Set a 1-second timeout for the external provider call
-	ctx, cancel := context.WithTimeout(r.Context(), 1*time.Second)
+	// Set a 5-second timeout for the external provider call (WAS 1 second)
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 	defer cancel()
 
 	log.Printf("Starting transaction %s via %s", req.TransactionID, provider.Name())
@@ -158,6 +177,17 @@ func (a *Aggregator) PayHandler(w http.ResponseWriter, r *http.Request) {
 	if errCB != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		log.Printf("Provider/CB Error: %v", errCB)
+
+		// Try to cast the result, which might contain the FAILED status details
+		res, ok := result.(*providers.PaymentResponse)
+		if ok && res.Status == "FAILED" {
+			// If the provider returned a structured FAILED response (even with an error), send it back
+			w.WriteHeader(http.StatusOK) // Use 200 OK because the failure is known and contained
+			json.NewEncoder(w).Encode(res)
+			return
+		}
+
+		// Default error response for true unknown errors (e.g. timeout)
 		json.NewEncoder(w).Encode(map[string]string{"error": fmt.Sprintf("Processing error: %v", errCB)})
 		return
 	}

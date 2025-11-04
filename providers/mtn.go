@@ -7,12 +7,16 @@ import (
 	"time"
 )
 
+func init() {
+	// Use the init function to seed the global generator exactly ONCE upon package load
+	rand.Seed(time.Now().UnixNano())
+}
+
 type MTNProvider struct{}
 
 func NewMTNProvider() *MTNProvider {
-    // FIX: Seed the random number generator only once when the provider is created.
-    // This ensures that the failure logic is truly random on each server run.
-	rand.Seed(time.Now().UnixNano()) 
+	// FIX: Seed the random number generator only once when the provider is created.
+	// This ensures that the failure logic is truly random on each server run.
 	return &MTNProvider{}
 }
 
@@ -31,23 +35,25 @@ func (p *MTNProvider) ProcessPayment(ctx context.Context, req PaymentRequest) (*
 		// Continue
 	}
 
-	// 1. Simulate external API Errors (e.g., 10% chance of 500 server error)
-	// rand.Float64() returns a float between 0.0 and 1.0. If it's < 0.10, it fails.
-	if rand.Float64() < 0.10 {
-		return &PaymentResponse{
+	// 1. Simulate external API Errors (80% chance of 500 server error)
+	if rand.Float64() < 0.80 {
+		// Create the response object
+		res := &PaymentResponse{
 			Status:       "FAILED",
 			ReferenceID:  "N/A",
 			ProviderName: p.Name(),
 			Message:      "Provider internal server error (simulated 500)",
-		}, nil
+		}
+		// RETURN BOTH THE RESPONSE AND A NEW ERROR OBJECT
+		return res, fmt.Errorf("provider failure: %s", res.Message) // <-- CRITICAL CHANGE HERE
 	}
 
 	// 2. Simulate Success
 	return &PaymentResponse{
-		Status:        "SUCCESS",
-		ReferenceID:   fmt.Sprintf("MTN-%d", time.Now().UnixNano()),
-		ProviderName:  p.Name(),
-		IsIdempotent:  false,
-		Message:       "Transaction processed successfully.",
-	}, nil
+		Status:       "SUCCESS",
+		ReferenceID:  fmt.Sprintf("MTN-%d", time.Now().UnixNano()),
+		ProviderName: p.Name(),
+		IsIdempotent: false,
+		Message:      "Transaction processed successfully.",
+	}, nil // Success returns nil error
 }
